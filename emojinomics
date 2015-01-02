@@ -1,0 +1,204 @@
+#!/usr/bin/python
+import urllib2
+import sqlite3
+import re
+from operator import itemgetter
+import math
+import argparse
+import os
+import sys
+
+parser = argparse.ArgumentParser(description='Process some emojis.')
+parser.add_argument('--total', action='store_true', default=False,
+                    help="Display total count, not proportions")
+parser.add_argument('--min', type=float,
+                    help="Minimum value to display")
+parser.add_argument('--theirs', action='store_true', default=False,
+                    help="Messages they sent to you")
+parser.add_argument('--number',
+                    help="Phone number to query")
+parser.add_argument('--compare',
+                    help="Compare all messages, messages sent to --number, or messages not sent to --number against --number")
+parser.add_argument('--path',
+                    help="Path to sms sqlite db")
+parser.add_argument('--marginal', action='store_true', default=False,
+                    help="Path to imessage sqlite db")
+
+
+args = parser.parse_args()
+
+emoji_url = 'http://www.unicode.org/Public/emoji/1.0/emoji-data.txt'
+emojis = set()
+
+emoji_text = urllib2.urlopen(emoji_url).read().split('\n')
+
+for line in emoji_text:
+    if not line or line[0] == '#':
+        continue
+    entries = line.split(';')
+    entry = entries[0].strip().split()
+    code_points = [x[2:] for x in entry]
+    ret = u''
+    num_zeros = 0
+    for code_point in code_points:
+        if len(code_point) <= 4:
+            ret += '\u'
+            num_zeros = (4 - len(code_point))
+        else:
+            ret += '\U'
+            num_zeros = (8 - len(code_point))
+        ret += '0' * num_zeros + code_point
+    emoji = ret.decode('unicode-escape')
+    emojis.add(emoji)
+
+emoji_regex = '|'.join([x for x in emojis
+                        if not x.startswith(u'\u002a')])
+
+def get_hist (conn, my_messages=True, number=None, complement=False):
+    c = conn.cursor()
+    handle_ids = None
+    if number:
+        fltr = '<>' if complement else '='
+        c.execute("SELECT rowid from handle where id {0} '{1}'".format(fltr, number))
+        hits = c.fetchall()
+        if not hits:
+            sys.stderr.write("Didn't find that phone number.\n")
+            sys.stderr.flush()
+            sys.exit(1)
+        handle_ids = [x[0] for x in hits]
+    query = "SELECT text from message WHERE is_from_me = {0}".format(1 if my_messages else 0)
+    if handle_ids:
+        fltr = ' OR '.join(['handle_id = {0}'.format(x) for x in handle_ids])
+        query +=  " AND ( {0} )".format(fltr)
+    c.execute(query)
+    emoji_hist = {}
+    for message in c.fetchall():
+        msg = message[0]
+        if not msg:
+            continue
+        matches = re.findall(emoji_regex, msg)
+        for m in matches:
+            try:
+                emoji_hist[m] += 1
+            except KeyError:
+                emoji_hist[m] = 1
+    return emoji_hist
+
+def plot_dict(d, max_val=None):
+    if not d:
+        sys.stderr.write("Didn't emoji.\n")
+        sys.stderr.flush()
+        sys.exit(1)
+    max_val = max_val or max(d.values())
+    total = sum(d.values())
+    num_chars = 5
+    for k, v in sorted(d.items(), key=itemgetter(1)):
+        num_blocks = int(v * 100 / max_val)
+        if v < args.min:
+            continue
+        label = "{0:.2f}".format(v)
+        print label + (' ' * (num_chars - len(label))) + (k * num_blocks)
+
+def plot_total_dict(d):
+    max_val = max(d.values())
+    total = sum(d.values())
+    num_chars = int(math.floor(math.log10(max_val)) + 2)
+    for k, v in sorted(d.items(), key=itemgetter(1)):
+        num_blocks = v
+        if v < args.min:
+            continue
+        label = str(v)
+        print label + (' ' * (num_chars - len(label))) + (k * num_blocks)
+
+def scale_dict(d):
+    max_val = sum(d.values())
+    for k in d.keys():
+        d[k] /= float(max_val)
+    
+def prop_d (d_):
+    d = d_.copy()
+    total = sum(d.values())
+    for k in d:
+        d[k] /= float(total)
+    return d
+        
+def calc_delta (mine, theirs):
+    mine = prop_d(mine)
+    theirs = prop_d(theirs)
+    overlap = {}
+    for k in theirs.keys():
+        if k in mine:
+            if mine[k] > theirs[k]:
+                mine[k] -= theirs[k]
+                overlap[k] = theirs[k]
+                del theirs[k]
+            elif mine[k] < theirs[k]:
+                theirs[k] -= mine[k]
+                overlap[k] = mine[k]
+                del mine[k]
+            else:
+                overlap[k] = mine[k]
+                del theirs[k]
+                del mine[k]
+    return [mine, overlap, theirs]
+
+def ls_tr (path):
+    mtime = lambda f: os.stat(os.path.join(path, f)).st_mtime
+    return list(sorted(os.listdir(path), key=lambda t: -1 * mtime(t)))
+    
+def resolve_path():
+    path = None
+    if sys.platform == 'darwin':
+        path = os.path.expanduser('~/Library/Application Support/MobileSync/Backup/')
+    path = os.path.join(path, ls_tr(path)[0], '3d0d7e5fb2ce288813306e4d4636395e047a3d28')
+    return path
+    
+def main():
+    args.path = args.path or resolve_path()
+    conn = sqlite3.connect(args.path)
+    args.mine = not args.theirs
+    if args.compare:
+        mine = None
+        if args.compare == 'full':
+            mine = get_hist(conn)
+        elif args.compare == 'marginal':
+            mine = get_hist(conn, True, args.number, False)
+        elif args.compare == 'rest':
+            mine = get_hist(conn, True, args.number, True)
+        else:
+            sys.stderr.write("Wrong --compare given.\n")
+            sys.stderr.flush()
+            sys.exit(1)
+        theirs = get_hist(conn, False, args.number)
+        mine, overlap, theirs = calc_delta(mine, theirs)
+        max_val = max(mine.values() + overlap.values() +
+                      theirs.values())
+        print "Your difference:"
+        plot_dict(mine, max_val)
+        print "Overlap:"
+        plot_dict(overlap, max_val)
+        print "Their difference:"
+        plot_dict(theirs, max_val)
+    elif args.marginal:
+        mine = get_hist(conn, True, args.number, False)
+        marginal = get_hist(conn, True, args.number, True)
+        mine, overlap, marginal = calc_delta(mine, marginal)
+        max_val = max(mine.values() + overlap.values() +
+                      marginal.values())
+        print "To everyone else:"
+        plot_dict(mine, max_val)
+        print "Overlap:"
+        plot_dict(overlap, max_val)
+        print "To {0}:".format(args.number)
+        plot_dict(marginal, max_val)
+    else:
+        emoji_hist = get_hist(conn, args.mine, args.number)
+        if args.total:
+            plot_total_dict(emoji_hist)
+        else:
+            scale_dict(emoji_hist)
+            plot_dict(emoji_hist)
+
+if __name__ == "__main__":
+    main()
+
